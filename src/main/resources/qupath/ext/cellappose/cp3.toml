@@ -1,0 +1,36 @@
+[workspace]
+channels = ["conda-forge", "pytorch"]
+# osx-64 (Intel Mac) is omitted: pixi panics cross-resolving PyPI deps for
+# osx-64 from a Windows/ARM host, and Intel Macs are not a supported target.
+platforms = ["linux-64", "osx-arm64", "win-64"]
+
+# CUDA hint: tells pixi CUDA 12 is available on the host. macOS ignores it
+# (no NVIDIA). On Linux/Windows it steers the resolver to the CUDA PyTorch
+# variant. MUST be global, not per-target.
+[system-requirements]
+cuda = "12"
+
+[dependencies]
+python = "3.11.*"
+pip = ">=23.0"
+appose = ">=0.10.1"
+numpy = ">=1.24.0,<2.0"
+
+# PyTorch (base dependency for all platforms). Cellpose pulls torch itself, but
+# providing it from conda-forge keeps the cross-platform GPU story consistent
+# with the rest of the monorepo (DL classifier pattern).
+pytorch = ">=2.1.0"
+torchvision = ">=0.16.0"
+
+# CUDA GPU support: pytorch-gpu steers the resolver to the CUDA variant. It only
+# exists for Linux and Windows (macOS has no NVIDIA support).
+[target.linux-64.dependencies]
+pytorch-gpu = ">=2.1.0"
+
+[target.win-64.dependencies]
+pytorch-gpu = ">=2.1.0"
+
+# Cellpose 3.x from PyPI. Pinned to the cp3 major; cp3 and cp4 cannot coexist in
+# one environment, hence the two-env design (see APPOSE_CELLPOSE_PORTING.md).
+[pypi-dependencies]
+cellpose = ">=3,<4"

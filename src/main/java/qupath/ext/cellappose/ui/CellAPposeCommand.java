@@ -614,9 +614,20 @@ public final class CellAPposeCommand {
                         if (tempParent != null) {
                             imageData.getHierarchy().addObject(tempParent);
                         }
-                        detector.detectObjects(imageData, parents);
+                        final int nObjects = detector.detectObjects(imageData, parents);
                         Platform.runLater(() -> {
-                            Dialogs.showInfoNotification("CellAPpose", "Cellpose detection complete.");
+                            if (nObjects == 0) {
+                                // A run that found nothing is not a success -- say what to change.
+                                Dialogs.showWarningNotification(
+                                        "CellAPpose",
+                                        "Cellpose finished but found no objects. Check the channel selection, "
+                                                + "the object diameter and the requested pixel size, then run again.");
+                            } else {
+                                Dialogs.showInfoNotification(
+                                        "CellAPpose",
+                                        "Cellpose detection complete: " + nObjects
+                                                + (nObjects == 1 ? " object" : " objects") + " created.");
+                            }
                             // Keep the dialog open for repeated runs; just re-enable Run and refresh
                             // the "runs on N objects" count for the next selection.
                             runButton.setDisable(false);
@@ -661,7 +672,9 @@ public final class CellAPposeCommand {
                 .tileOverlap(tileOverlapSpinner.getValue())
                 .pixelSize(pixelSizeSpinner.getValue())
                 .cellExpansion(cellExpansionSpinner.getValue())
-                .constrainToParent(constrainCheck.isSelected())
+                // The checkbox is greyed out unless Cells is the output type, so do not let a
+                // stale ticked state leak into a Detections/Annotations run.
+                .constrainToParent(!constrainCheck.isDisable() && constrainCheck.isSelected())
                 .useGpu(gpuCheck.isSelected());
 
         if (family == CellposeModelFamily.CP3) {
@@ -766,9 +779,13 @@ public final class CellAPposeCommand {
         } else {
             cellChannelCombo.setValue(firstChannel); // CP3 cell = first channel
             nucleiChannelCombo.setValue("None");
+            // Cellpose-SAM is handed exactly the channels picked here, so on an RGB image a
+            // one-channel default would segment a single colour plane while the CP3 path on
+            // the same image sees all three. Default RGB to the full 3-channel stack.
+            boolean rgbDefault = server.isRGB() && names.size() > 3;
             cp4Channel1Combo.setValue(firstChannel); // CP4 channel 1 = first channel
-            cp4Channel2Combo.setValue("None");
-            cp4Channel3Combo.setValue("None");
+            cp4Channel2Combo.setValue(rgbDefault ? names.get(2) : "None");
+            cp4Channel3Combo.setValue(rgbDefault ? names.get(3) : "None");
         }
     }
 

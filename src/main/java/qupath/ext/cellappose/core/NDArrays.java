@@ -189,8 +189,13 @@ public final class NDArrays {
 
     /**
      * Allocates a zeroed (H, W) uint16 NDArray for the vendored scripts' pre-allocated
-     * {@code output_labels} buffer. Cellpose label rasters are non-negative integers;
-     * a single tile will not exceed 65535 objects, so uint16 is sufficient.
+     * {@code output_labels} buffer. Cellpose label rasters are non-negative integers and a
+     * single tile is not expected to exceed 65535 objects, so uint16 is sufficient in
+     * practice. It is NOT safe above that: the scripts fill the buffer with
+     * {@code output_labels[:] = masks}, a numpy slice assignment that casts unsafely and
+     * silently, so label 65536 would wrap to background. {@code Cellpose2D} therefore
+     * compares the {@code n_labels} scalar published by the scripts against 65535 and
+     * fails the run rather than returning wrapped labels.
      *
      * @param h tile height in pixels
      * @param w tile width in pixels

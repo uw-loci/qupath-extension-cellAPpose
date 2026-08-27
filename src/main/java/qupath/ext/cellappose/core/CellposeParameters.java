@@ -189,9 +189,11 @@ public final class CellposeParameters {
     }
 
     /**
-     * The model-caching key. The init script reloads (and re-exports) the cellpose
-     * model whenever model selection, diameter, or GPU usage change vs. the cached
-     * configuration.
+     * The model-caching key. The init script reloads (and re-exports) the cellpose model
+     * whenever the model family, the built-in model name, the custom model path, or the
+     * GPU choice change vs. the cached configuration. Diameter is deliberately NOT part
+     * of the key: it is a per-evaluation argument passed with each tile, so changing it
+     * does not require reloading the model.
      */
     public String modelCacheKey() {
         return family.name() + "|" + (modelName == null ? "" : modelName) + "|"

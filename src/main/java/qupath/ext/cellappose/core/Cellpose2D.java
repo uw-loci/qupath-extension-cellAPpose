@@ -41,7 +41,16 @@ public final class Cellpose2D {
 
     private static final Logger logger = LoggerFactory.getLogger(Cellpose2D.class);
 
+    /**
+     * Largest label value the shared uint16 output buffer can carry
+     * (see {@link NDArrays#allocateLabelNDArray(int, int)}).
+     */
+    private static final int MAX_LABELS_PER_TILE = 65535;
+
     private final CellposeParameters params;
+
+    /** Set once the missing-{@code n_labels} warning has been logged, to keep it off the per-tile path. */
+    private boolean warnedMissingLabelCount = false;
 
     Cellpose2D(CellposeParameters params) {
         this.params = params;
@@ -71,9 +80,12 @@ public final class Cellpose2D {
      * @param imageData the image data
      * @param parents   the parent objects to detect within (whole image if a single
      *                  full-image annotation, or each selected annotation)
+     * @return the total number of objects added to the hierarchy; 0 means the run
+     *         completed but detected nothing, which is a result the caller should
+     *         surface rather than treat as success
      * @throws IOException if the Appose backend is unavailable or a tile task fails
      */
-    public void detectObjects(ImageData<BufferedImage> imageData, Collection<? extends PathObject> parents)
+    public int detectObjects(ImageData<BufferedImage> imageData, Collection<? extends PathObject> parents)
             throws IOException {
         ImageServer<BufferedImage> server = imageData.getServer();
         PathObjectHierarchy hierarchy = imageData.getHierarchy();
@@ -93,6 +105,17 @@ public final class Cellpose2D {
                 runId,
                 paramsHash);
 
+        // Cellpose-SAM only sees the channels picked in the dialog. On an RGB image a
+        // single-channel selection hands it one colour plane while the CP3 path on the
+        // same image gets all three, which usually looks like "CP4 segments badly".
+        if (params.family() == CellposeModelFamily.CP4 && server.isRGB() && params.cp4SourceBands().length == 1) {
+            logger.warn(
+                    "CellAPpose: Cellpose-SAM is running on an RGB image with only one channel selected"
+                            + " (source band {}); the other two colour planes are ignored. Select all three"
+                            + " channels for brightfield/H&E images.",
+                    params.cp4SourceBands()[0]);
+        }
+
         ApposeCellposeService service = ApposeCellposeService.getInstance();
         // Lazily ensure the family's environment is built and its service is running.
         // The GUI dialog does build-then-run; the scripting API (batch / headless
@@ -106,6 +129,7 @@ public final class Cellpose2D {
         // Load (and cache) the model for this configuration once.
         service.ensureModel(params.family(), params.modelCacheKey(), params.toInitInputs());
 
+        int totalCreated = 0;
         for (PathObject parent : parents) {
             ROI parentRoi = parent.getROI();
             if (parentRoi == null) {
@@ -113,13 +137,32 @@ public final class Cellpose2D {
             }
             List<PathObject> created = detectInParent(server, parentRoi, downsample, overlap, service);
             if (created.isEmpty()) {
+                logger.warn("CellAPpose: no objects detected in parent '{}'", parent.getDisplayedName());
                 continue;
             }
+            totalCreated += created.size();
             stampProvenance(created, runId, paramsHash, downsample);
             parent.addChildObjects(created);
             parent.setLocked(true);
         }
         hierarchy.fireHierarchyChangedEvent(this);
+
+        if (totalCreated == 0) {
+            // A run that finds nothing is a failed run from the user's point of view;
+            // say so, and name the settings that most often cause it.
+            logger.warn(
+                    "CellAPpose: detection finished but produced NO objects across {} parent object(s)."
+                            + " Check the channel selection, the object diameter ({} um) and the requested"
+                            + " pixel size ({} um/px).",
+                    parents.size(),
+                    params.diameter(),
+                    params.pixelSize());
+        } else {
+            logger.info(
+                    "CellAPpose: detection created {} objects across {} parent object(s)",
+                    totalCreated,
+                    parents.size());
+        }
 
         // Record a replayable WorkflowStep so a dialog run can be reproduced from
         // History (classify-object-subset pattern: emit the equivalent builder script).
@@ -131,6 +174,7 @@ public final class Cellpose2D {
         } catch (RuntimeException e) {
             logger.warn("Could not add CellAPpose workflow step: {}", e.getMessage());
         }
+        return totalCreated;
     }
 
     /**
@@ -297,7 +341,9 @@ public final class Cellpose2D {
                 inputs.put("n_channels", cp4NChannels);
             }
             Task task = service.runTile(params.family(), inputs);
-            logger.debug("CellAPpose tile {} -> n_labels={}", request, task.outputs.get("n_labels"));
+            int nLabels = labelCount(task);
+            logger.debug("CellAPpose tile {} -> n_labels={}", request, nLabels);
+            checkLabelCount(nLabels, request);
 
             float[] labelRaster = NDArrays.readLabelsAsFloat(labels, h, w);
             return LabelToObjects.labelsToROIs(labelRaster, w, h, request);
@@ -317,6 +363,63 @@ public final class Cellpose2D {
                 }
             }
         }
+    }
+
+    /**
+     * Reads the {@code n_labels} scalar the Python scripts publish alongside the shared
+     * label buffer (the largest label value written, i.e. the object count for a
+     * contiguous Cellpose labelling).
+     *
+     * @param task the completed tile task
+     * @return the label count, or -1 if the script did not publish a usable value
+     */
+    private static int labelCount(Task task) {
+        Object value = task.outputs.get("n_labels");
+        if (value instanceof Number number) {
+            return number.intValue();
+        }
+        return -1;
+    }
+
+    /**
+     * Fails the run when a tile produced more objects than the shared uint16 label
+     * buffer can represent. Python writes the labels with {@code output_labels[:] = masks},
+     * a numpy slice assignment that casts UNSAFELY and SILENTLY: object 65536 would wrap
+     * to 0 (background) and 65537 would merge into object 1. Detecting it here and
+     * stopping is the difference between a wrong result and a reported one.
+     *
+     * @param nLabels the label count reported by the Python task, or -1 if unknown
+     * @param request the tile region, for the error message
+     * @throws IOException if the count exceeds what the uint16 buffer can hold
+     */
+    private void checkLabelCount(int nLabels, RegionRequest request) throws IOException {
+        if (nLabels < 0) {
+            // The scripts always publish n_labels; if one stops, say so rather than
+            // letting the overflow guard quietly become a no-op.
+            if (!warnedMissingLabelCount) {
+                warnedMissingLabelCount = true;
+                logger.warn("CellAPpose: the Python task published no usable 'n_labels' output;"
+                        + " the 16-bit label-buffer overflow guard is inactive for this run.");
+            }
+            return;
+        }
+        if (nLabels <= MAX_LABELS_PER_TILE) {
+            return;
+        }
+        int suggested = Math.max(64, params.tileSize() / 2);
+        throw new IOException(String.format(
+                "CellAPpose: the tile at %s produced %d objects, more than the %d that the 16-bit label"
+                        + " buffer shared with Python can hold. Labels above %d would be silently corrupted"
+                        + " (object %d would become background), so the run was stopped instead of returning"
+                        + " a wrong result. Reduce the tile size from %d px to about %d px (or increase the"
+                        + " requested pixel size) so each tile holds fewer objects.",
+                request,
+                nLabels,
+                MAX_LABELS_PER_TILE,
+                MAX_LABELS_PER_TILE,
+                MAX_LABELS_PER_TILE + 1,
+                params.tileSize(),
+                suggested));
     }
 
     private List<PathObject> buildObjects(List<ROI> rois, ROI parentRoi, double downsample) {

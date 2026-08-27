@@ -59,9 +59,13 @@ first use (`cellappose-cp3` / `cellappose-cp4`) -- see *Managing environments*.
 built-in models (`cyto3`, `cyto2`, `nuclei`). It is the default. Choose it when
 you have a defined cytoplasm/nucleus channel pair or want one of those models.
 
-**Cellpose-SAM / Cellpose 4 (CP4)** is channel-flexible -- it uses all channels
-with no cell/nuclei split -- and uses the SAM-based generalist model. Choose it for
-arbitrary or many-channel images, or when you want the newest model.
+**Cellpose-SAM / Cellpose 4 (CP4)** is channel-flexible -- no cell/nuclei split --
+and uses the SAM-based generalist model. Choose it for arbitrary or many-channel
+images, or when you want the newest model. It takes **up to 3 channels**, and it
+receives exactly the ones picked in the dialog: on an RGB (brightfield / H&E) image
+all three colour planes are selected by default, and on a multi-channel fluorescence
+image only Channel 1 is, so set Channel 2 and Channel 3 yourself if the model should
+see them.
 
 | If you... | Use | Why |
 |---|---|---|
@@ -71,8 +75,8 @@ arbitrary or many-channel images, or when you want the newest model.
 | are unsure | CP3 | the shipped default; switch to CP4 if it underperforms |
 
 The dialog only shows the controls relevant to the selected family: CP3 shows the
-built-in-model dropdown and the cell/nuclei channel selectors; CP4 shows a note
-that it uses all channels with no split.
+built-in-model dropdown and the cell/nuclei channel selectors; CP4 shows a Channel
+1/2/3 picker (set the extras to None for a single-channel run).
 
 </details>
 
@@ -88,6 +92,9 @@ Every Run-dialog control, in dialog order, with the **real defaults** from
 | Built-in model | Model and channels (CP3) | `cyto3` | cyto3 / cyto2 / nuclei | CP3 built-in model. cyto3/cyto2 segment whole cells; nuclei segments nuclei only. |
 | Cell channel | Model and channels (CP3) | first channel | None or a channel | Image channel showing the cell body / cytoplasm. |
 | Nuclei channel | Model and channels (CP3) | None | None or a channel | Image channel showing nuclei. Set to None for cells only. |
+| Channel 1 | Model and channels (CP4) | first channel | None or a channel | First channel sent to Cellpose-SAM. |
+| Channel 2 | Model and channels (CP4) | second channel on an RGB image, else None | None or a channel | Second channel sent to Cellpose-SAM. |
+| Channel 3 | Model and channels (CP4) | third channel on an RGB image, else None | None or a channel | Third channel sent to Cellpose-SAM. Cellpose-SAM takes at most 3. |
 | Diameter (px) | Detection parameters | 30 | 0..1000 px | Expected object diameter in pixels. **0 = let Cellpose estimate automatically.** |
 | Cell probability | Detection parameters | 0.0 | -6.0..6.0 | Detection sensitivity. Lower finds more (and smaller) objects; higher is stricter. |
 | Flow threshold | Detection parameters | 0.4 | 0.0..1.0 | Maximum allowed flow error per mask. Lower rejects more poorly-shaped objects. |
@@ -306,17 +313,25 @@ nuclei)` (CP3), `channelsCP4(int n, Integer chan0, Integer chan1, Integer chan2)
 `constrainToParent(boolean)`, `useGpu(boolean)`, `createDetections()`,
 `createCells()`, `createAnnotations()`, `build()`.
 
-`detectObjects` adds the objects to the hierarchy itself; call
-`fireHierarchyUpdate()` afterward to refresh the viewer. It throws `IOException`
-if the Appose backend is unavailable or a tile task fails -- check the Python
-Console for the underlying Python traceback.
+`detectObjects` adds the objects to the hierarchy itself and **returns the number
+of objects it created** (0 means the run completed but found nothing -- usually a
+channel, diameter, or pixel-size problem, and the dialog reports it as a warning
+rather than as success). Call `fireHierarchyUpdate()` afterward to refresh the
+viewer. It throws `IOException` if the Appose backend is unavailable or a tile task
+fails -- check the Python Console for the underlying Python traceback.
 
-**Scripting covers what the dialog does not yet surface.** Two options are
-available in the builder today but not exposed as dialog controls in this release:
-a **CP3 custom trained model** (`.customModel("/path/to/model")`) and an explicit
-**CP4 channel picker** (`.channelsCP4(...)`). The dialog uses the CP3 built-in
-models and "all channels" for CP4; use the builder above if you need a custom model
-or a specific channel subset. Surfacing both in the dialog is planned for v1.1.
+**One tile can hold at most 65,535 objects.** The label raster is handed back from
+Python through a shared 16-bit buffer, so a tile producing more objects than that
+would silently wrap (object 65,536 would become background). The run stops with an
+`IOException` naming the offending tile instead; halve `tileSize(...)` or raise
+`pixelSize(...)` if you ever hit it.
+
+**Scripting covers what the dialog does not yet surface.** One option is available
+in the builder today but not exposed as a dialog control in this release: a **CP3
+custom trained model** (`.customModel("/path/to/model")`). The dialog offers only
+the CP3 built-in models, so use the builder above if you need a custom model.
+Surfacing it in the dialog is planned for v1.1. (The CP4 channel subset
+`.channelsCP4(...)` *is* in the dialog, as the Channel 1/2/3 picker.)
 
 </details>
 
@@ -397,9 +412,9 @@ The following are intentionally deferred to a future release:
   mid-run; closing QuPath is the only way to stop a very long run.
 - **Run across a whole project (batch).** Detection runs on the current image only;
   batching across project images is not yet built (scripting can loop today).
-- **Custom model + channel picker in the dialog.** The CP3 custom-model path and the
-  CP4 channel subset are available via the `Cellpose2D.builder` scripting API today
-  (see section 6); surfacing them as dialog controls is planned.
+- **Custom model in the dialog.** The CP3 custom-model path is available via the
+  `Cellpose2D.builder` scripting API today (see section 6); surfacing it as a dialog
+  control is planned.
 - **Documentation screenshots** of the dialogs and a worked seam example.
 - **Per-tile error-resilience tuning** (e.g. continue-on-tile-failure policy).
 

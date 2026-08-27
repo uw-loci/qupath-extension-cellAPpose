@@ -43,9 +43,10 @@ dependencies {
     shadow(libs.qupath.fxtras)
     shadow(libs.gson)
 
-    // Appose for embedded Java-Python IPC with shared memory.
-    // NOT shadowed -- Appose is on QuPath's classpath at runtime (DL classifier / fiber precedent).
-    implementation("org.apposed:appose:0.11.0")
+    // Appose for embedded Java-Python IPC with shared memory. QuPath does NOT ship Appose,
+    // so this is `implementation` and IS bundled into the shadow jar (it lands on
+    // runtimeClasspath, which is exactly what shadowJar packages).
+    implementation("org.apposed:appose:0.12.0")
 
     // For testing
     testImplementation(libs.bundles.qupath)
@@ -64,6 +65,14 @@ dependencies {
 // (NDArray ShmFactory, Groovy FastStringService, etc.).
 tasks.shadowJar {
     mergeServiceFiles()
+    // NOTE: Appose is bundled UNRELOCATED, so this jar can collide with a sibling
+    // extension that bundles a different Appose version. Relocating it needs shadow
+    // 9.x -- shadow 8.3.5's bundled ASM cannot read the Java 25 class files this repo
+    // compiles to ("Unsupported class file major version 69"), so `relocate(...)` fails
+    // the build here. Verified 2026-08-27: on shadow 9.6.1 the relocation succeeds
+    // (93 entries move to qupath/ext/cellappose/thirdparty/appose/, 0 left under
+    // org/apposed/appose/), but it needs a live Appose Python round-trip to confirm
+    // nothing in Appose resolves its own classes by string name.
 }
 
 tasks.withType<JavaCompile> {

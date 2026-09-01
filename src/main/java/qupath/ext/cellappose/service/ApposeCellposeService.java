@@ -87,7 +87,8 @@ public final class ApposeCellposeService {
      * Returns the path where the given family's Appose pixi environment lives.
      */
     public static Path getEnvironmentPath(CellposeModelFamily family) {
-        return Path.of(System.getProperty("user.home"), ".local", "share", "appose", family.envName());
+        return ApposeEnvLocation.resolve(
+                qupath.ext.cellappose.CellAPposePrefs.getEnvBaseDir(), family.envName());
     }
 
     /**
@@ -147,12 +148,25 @@ public final class ApposeCellposeService {
                 // env dir by syncManifest above, and the explicit runPixiInstall below runs
                 // `pixi install --frozen` (subcommand flag, correct), so the frozen-from-lock
                 // intent is preserved without breaking build().
-                h.environment = Appose.pixi()
+                var envBuilder = Appose.pixi()
                         .content(pixiToml)
                         .scheme("pixi.toml")
                         .name(family.envName())
-                        .logDebug()
-                        .build();
+                        .logDebug();
+
+                // Builder.base() overrides name(), so pass the FULL
+                // <base>/<envName> directory -- the same path
+                // getEnvironmentPath(family) reports and the manifest was staged
+                // into. Setting only one of those would move where we SAY the
+                // environment is while Appose kept building elsewhere.
+                Path configuredDir = configuredEnvDir(family);
+                if (configuredDir != null) {
+                    Files.createDirectories(configuredDir);
+                    envBuilder.base(configuredDir.toFile());
+                    logger.info("Building the {} environment at the configured location: {}",
+                            family, configuredDir);
+                }
+                h.environment = envBuilder.build();
                 logger.info("cellAPpose {} env configured at: {}", family, h.environment.base());
 
                 // Install strictly from the bundled lock (--frozen) so cellpose +
@@ -201,6 +215,9 @@ public final class ApposeCellposeService {
                 h.cachedTaskScript = loadScript(family.taskScript());
 
                 h.initialized = true;
+                // Built AND verified: the only point at which offering to remove
+                // the environment this replaced is safe.
+                offerPreviousEnvCleanup(family);
                 h.initError = null;
                 registerShutdownHook();
                 report(statusCallback, "Setup complete!");
@@ -695,6 +712,48 @@ public final class ApposeCellposeService {
     private static void report(Consumer<String> callback, String message) {
         if (callback != null) {
             callback.accept(message);
+        }
+    }
+
+    /**
+     * The configured directory for one family's environment, or null for the
+     * Appose default. Kept beside {@link #getEnvironmentPath} so the reported
+     * and built locations cannot drift apart.
+     */
+    private static Path configuredEnvDir(CellposeModelFamily family) {
+        String base = qupath.ext.cellappose.CellAPposePrefs.getEnvBaseDir();
+        if (base == null || base.isBlank()) {
+            return null;
+        }
+        return ApposeEnvLocation.resolve(base, family.envName());
+    }
+
+    /**
+     * After a VERIFIED build, offer to remove the environment this one replaced.
+     *
+     * <p>Per family: the two environments are built independently and either can
+     * be moved on its own, so a shared record would offer to delete the wrong
+     * one. Off the init thread, and a no-op without a UI.
+     */
+    private void offerPreviousEnvCleanup(CellposeModelFamily family) {
+        final Path current = getEnvironmentPath(family);
+        final String previous =
+                qupath.ext.cellappose.CellAPposePrefs.getEnvLastBuiltDir(family);
+        qupath.ext.cellappose.CellAPposePrefs.setEnvLastBuiltDir(family, current.toString());
+        if (previous == null || previous.isBlank() || previous.equals(current.toString())) {
+            return;
+        }
+        try {
+            javafx.application.Platform.runLater(() -> {
+                try {
+                    ApposeEnvLocation.promptCleanup(Path.of(previous), current);
+                } catch (Exception e) {
+                    logger.warn("Previous-environment cleanup prompt failed: {}", e.getMessage());
+                }
+            });
+        } catch (IllegalStateException e) {
+            logger.info("Previous {} environment at {} left in place (no UI available)",
+                    family, previous);
         }
     }
 }

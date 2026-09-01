@@ -69,6 +69,7 @@ public class CellAPposeExtension implements QuPathExtension, GitHubProject {
         logger.info("Installing CellAPpose extension v{}", extVersion != null ? extVersion : "dev");
 
         CellAPposePrefs.installPreferences();
+        CellAPposePrefs.installPreferencePane(qupath);
 
         Menu extensionsMenu = qupath.getMenu("Extensions", true);
         Menu cellMenu = new Menu(EXTENSION_NAME);

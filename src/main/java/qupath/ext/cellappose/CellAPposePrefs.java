@@ -6,6 +6,9 @@ import javafx.beans.property.IntegerProperty;
 import javafx.beans.property.StringProperty;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import qupath.ext.cellappose.core.CellposeModelFamily;
+import qupath.fx.prefs.controlsfx.PropertyItemBuilder;
+import qupath.lib.gui.QuPathGUI;
 import qupath.lib.gui.prefs.PathPrefs;
 
 /**
@@ -19,6 +22,25 @@ import qupath.lib.gui.prefs.PathPrefs;
  * via fiber-analysis's {@code FiberAnalysisPreferences}.
  */
 public final class CellAPposePrefs {
+
+    // ==================== Python environment ====================
+    //
+    // DUPLICATED ACROSS THE APPOSE EXTENSIONS. The same pair of preferences and
+    // the same ApposeEnvLocation helper exist in QP-CAT, the DL pixel
+    // classifier, PPM and fiber-analysis. No shared library yet -- see
+    // claude-reports/TODO_LIST.md, "shared Appose env-location library". Change
+    // all five together or they diverge.
+    //
+    // Note cellAPpose has TWO environments (one per Cellpose family), so the
+    // base directory is shared and the family name is the subdirectory. The
+    // last-built record is therefore per family.
+
+    private static final String CATEGORY_ENV = "cellAPpose: Python environment";
+
+    private static javafx.beans.property.StringProperty envBaseDir;
+    private static javafx.beans.property.StringProperty envLastBuiltCp3;
+    private static javafx.beans.property.StringProperty envLastBuiltCp4;
+    private static boolean paneInstalled = false;
 
     private static final Logger logger = LoggerFactory.getLogger(CellAPposePrefs.class);
     private static final String PREFIX = "cellappose.";
@@ -73,6 +95,9 @@ public final class CellAPposePrefs {
             return;
         }
         logger.info("Installing CellAPpose preferences");
+        envBaseDir = PathPrefs.createPersistentPreference(PREFIX + "env.baseDir", "");
+        envLastBuiltCp3 = PathPrefs.createPersistentPreference(PREFIX + "env.lastBuilt.cp3", "");
+        envLastBuiltCp4 = PathPrefs.createPersistentPreference(PREFIX + "env.lastBuilt.cp4", "");
         family = PathPrefs.createPersistentPreference(PREFIX + "family", DEFAULT_FAMILY);
         builtinModel = PathPrefs.createPersistentPreference(PREFIX + "builtinModel", DEFAULT_BUILTIN_MODEL);
         diameter = PathPrefs.createPersistentPreference(PREFIX + "diameter", DEFAULT_DIAMETER);
@@ -176,5 +201,59 @@ public final class CellAPposePrefs {
 
     public static StringProperty cp4Channel3Property() {
         return cp4Channel3;
+    }
+
+    /** Base dir for the Appose envs, or "" for the Appose default. */
+    public static String getEnvBaseDir() {
+        installPreferences();
+        return envBaseDir.get();
+    }
+
+    public static void setEnvBaseDir(String v) {
+        installPreferences();
+        envBaseDir.set(v == null ? "" : v.strip());
+    }
+
+    /**
+     * Where this family's env was last successfully built; "" if never.
+     *
+     * <p>Per family, because the two environments are built independently and
+     * either can be moved on its own -- a single record would offer to delete
+     * the wrong one.
+     */
+    public static String getEnvLastBuiltDir(CellposeModelFamily f) {
+        installPreferences();
+        return (f == CellposeModelFamily.CP4
+                ? envLastBuiltCp4 : envLastBuiltCp3).get();
+    }
+
+    public static void setEnvLastBuiltDir(CellposeModelFamily f,
+                                          String v) {
+        installPreferences();
+        (f == CellposeModelFamily.CP4
+                ? envLastBuiltCp4 : envLastBuiltCp3).set(v == null ? "" : v);
+    }
+
+    /** Add the environment-location preference to QuPath's Preferences pane. */
+    public static synchronized void installPreferencePane(QuPathGUI qupath) {
+        if (qupath == null || paneInstalled) {
+            return;
+        }
+        installPreferences();
+        paneInstalled = true;
+        qupath.getPreferencePane().getPropertySheet().getItems().add(
+                new PropertyItemBuilder<>(envBaseDir, String.class)
+                        .propertyType(PropertyItemBuilder.PropertyType.DIRECTORY)
+                        .name("Python environment location")
+                        .category(CATEGORY_ENV)
+                        .description("Directory the Cellpose environments are built under "
+                                + "(one subdirectory per model family). Leave blank for the "
+                                + "default (~/.local/share/appose), which is right on most "
+                                + "machines. Set it when the home directory is quota-limited "
+                                + "-- on HPC and managed desktops environments this size fail "
+                                + "there. Changing it builds NEW environments; the old ones are "
+                                + "left alone and you are asked about removing them only after "
+                                + "the new ones work.")
+                        .build());
     }
 }

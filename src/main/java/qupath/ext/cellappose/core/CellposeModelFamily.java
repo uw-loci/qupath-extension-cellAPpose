@@ -33,14 +33,37 @@ public enum CellposeModelFamily {
         this.displayLabel = displayLabel;
     }
 
-    /** Appose environment name, e.g. {@code cellappose-cp3}. */
+    /** Appose environment name for the CPU variant, e.g. {@code cellappose-cp3}. */
     public String envName() {
         return envName;
     }
 
-    /** Bundled pixi manifest resource filename, e.g. {@code cp3.toml}. */
+    /**
+     * Appose environment name for one compute variant, e.g.
+     * {@code cellappose-cp3-gpu}.
+     *
+     * <p>The variant is part of the NAME, not just the manifest: a CPU and a
+     * CUDA environment for the same family must be able to coexist, or
+     * switching would half-overwrite the other and a switch back would rebuild
+     * from scratch.
+     */
+    public String envName(ComputeVariant variant) {
+        return variant == ComputeVariant.GPU ? envName + "-gpu" : envName;
+    }
+
+    /** Bundled pixi manifest for the CPU variant, e.g. {@code cp3.toml}. */
     public String tomlResource() {
         return tomlResource;
+    }
+
+    /** Bundled pixi manifest for one variant, e.g. {@code cp3-gpu.toml}. */
+    public String tomlResource(ComputeVariant variant) {
+        return variant == ComputeVariant.GPU ? tomlResource.replaceAll("\\.toml$", "-gpu.toml") : tomlResource;
+    }
+
+    /** Lock resource for one variant, derived so the pair cannot be mismatched. */
+    public String lockResource(ComputeVariant variant) {
+        return tomlResource(variant).replaceAll("\\.toml$", ".lock");
     }
 
     /**

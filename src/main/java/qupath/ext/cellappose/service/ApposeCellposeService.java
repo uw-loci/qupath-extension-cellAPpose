@@ -21,6 +21,7 @@ import org.apposed.appose.TaskException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import qupath.ext.cellappose.core.CellposeModelFamily;
+import qupath.ext.cellappose.core.ComputeVariant;
 import qupath.ext.cellappose.ui.PythonConsoleWindow;
 import qupath.lib.common.GeneralTools;
 
@@ -86,9 +87,14 @@ public final class ApposeCellposeService {
     /**
      * Returns the path where the given family's Appose pixi environment lives.
      */
+    /** The variant the user selected (CPU unless they chose otherwise). */
+    private static ComputeVariant variant() {
+        return ComputeVariant.fromId(qupath.ext.cellappose.CellAPposePrefs.getEnvVariant());
+    }
+
     public static Path getEnvironmentPath(CellposeModelFamily family) {
         return ApposeEnvLocation.resolve(
-                qupath.ext.cellappose.CellAPposePrefs.getEnvBaseDir(), family.envName());
+                qupath.ext.cellappose.CellAPposePrefs.getEnvBaseDir(), family.envName(variant()));
     }
 
     /**
@@ -131,8 +137,11 @@ public final class ApposeCellposeService {
             report(statusCallback, "Loading environment configuration...");
             logger.info("Initializing cellAPpose env for {}...", family);
 
-            String pixiToml = loadResource(RESOURCE_BASE + family.tomlResource());
-            String pixiLock = loadResource(RESOURCE_BASE + family.lockResource());
+            // Manifest and lock come from the same family AND variant, so they
+            // cannot be paired wrongly.
+            ComputeVariant computeVariant = variant();
+            String pixiToml = loadResource(RESOURCE_BASE + family.tomlResource(computeVariant));
+            String pixiLock = loadResource(RESOURCE_BASE + family.lockResource(computeVariant));
 
             ClassLoader original = Thread.currentThread().getContextClassLoader();
             Thread.currentThread().setContextClassLoader(ApposeCellposeService.class.getClassLoader());
@@ -151,7 +160,7 @@ public final class ApposeCellposeService {
                 var envBuilder = Appose.pixi()
                         .content(pixiToml)
                         .scheme("pixi.toml")
-                        .name(family.envName())
+                        .name(family.envName(computeVariant))
                         .logDebug();
 
                 // Builder.base() overrides name(), so pass the FULL
@@ -163,8 +172,7 @@ public final class ApposeCellposeService {
                 if (configuredDir != null) {
                     Files.createDirectories(configuredDir);
                     envBuilder.base(configuredDir.toFile());
-                    logger.info("Building the {} environment at the configured location: {}",
-                            family, configuredDir);
+                    logger.info("Building the {} environment at the configured location: {}", family, configuredDir);
                 }
                 h.environment = envBuilder.build();
                 logger.info("cellAPpose {} env configured at: {}", family, h.environment.base());
@@ -235,7 +243,7 @@ public final class ApposeCellposeService {
             if (looksLikeWindowsFileLock(fullMsg)) {
                 logger.warn(
                         "Pixi env install hit a Windows file lock; manual recovery required\n{}",
-                        windowsFileLockAdvice(family.envName()));
+                        windowsFileLockAdvice(family.envName(variant())));
                 report(statusCallback, "Pixi env install failed: Windows file lock. See recovery steps.");
                 try {
                     qupath.fx.dialogs.Dialogs.showWarningNotification(
@@ -429,7 +437,7 @@ public final class ApposeCellposeService {
     }
 
     private void wireConsole(EnvHandle h) {
-        String prefix = "[" + h.family.envName() + "] ";
+        String prefix = "[" + h.family.envName(variant()) + "] ";
         h.pythonService.debug(msg -> {
             logger.info("[CellAPpose Python]{}{}", prefix, msg);
             PythonConsoleWindow.appendMessage(prefix + msg);
@@ -725,7 +733,7 @@ public final class ApposeCellposeService {
         if (base == null || base.isBlank()) {
             return null;
         }
-        return ApposeEnvLocation.resolve(base, family.envName());
+        return ApposeEnvLocation.resolve(base, family.envName(variant()));
     }
 
     /**
@@ -737,8 +745,7 @@ public final class ApposeCellposeService {
      */
     private void offerPreviousEnvCleanup(CellposeModelFamily family) {
         final Path current = getEnvironmentPath(family);
-        final String previous =
-                qupath.ext.cellappose.CellAPposePrefs.getEnvLastBuiltDir(family);
+        final String previous = qupath.ext.cellappose.CellAPposePrefs.getEnvLastBuiltDir(family);
         qupath.ext.cellappose.CellAPposePrefs.setEnvLastBuiltDir(family, current.toString());
         if (previous == null || previous.isBlank() || previous.equals(current.toString())) {
             return;
@@ -752,8 +759,7 @@ public final class ApposeCellposeService {
                 }
             });
         } catch (IllegalStateException e) {
-            logger.info("Previous {} environment at {} left in place (no UI available)",
-                    family, previous);
+            logger.info("Previous {} environment at {} left in place (no UI available)", family, previous);
         }
     }
 }

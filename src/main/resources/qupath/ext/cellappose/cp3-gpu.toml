@@ -7,11 +7,13 @@ platforms = ["linux-64", "osx-arm64", "win-64"]
 # CUDA hint: tells pixi CUDA 12 is available on the host. macOS ignores it
 # (no NVIDIA). On Linux/Windows it steers the resolver to the CUDA PyTorch
 # variant. MUST be global, not per-target.
-# CPU VARIANT -- the default, because it installs anywhere. No cuda
-# system-requirement and no pytorch-gpu target: requiring CUDA makes
-# `pixi install` fail the __cuda check on every launch on a machine
-# without an NVIDIA GPU, so the extension cannot start at all. See
-# cp3-gpu.toml for the CUDA build, chosen in preferences.
+# GPU VARIANT. pixi validates the __cuda virtual package on EVERY install
+# -- every QuPath launch -- so this manifest CANNOT install without an
+# NVIDIA GPU. It does not run slowly there; it refuses to start. That is
+# why the CPU variant exists and is the default.
+[system-requirements]
+cuda = "12"
+
 [dependencies]
 python = "3.11.*"
 pip = ">=23.0"
@@ -23,6 +25,14 @@ numpy = ">=1.24.0,<2.0"
 # with the rest of the monorepo (DL classifier pattern).
 pytorch = ">=2.1.0"
 torchvision = ">=0.16.0"
+
+# CUDA GPU support: pytorch-gpu steers the resolver to the CUDA variant. It only
+# exists for Linux and Windows (macOS has no NVIDIA support).
+[target.linux-64.dependencies]
+pytorch-gpu = ">=2.1.0"
+
+[target.win-64.dependencies]
+pytorch-gpu = ">=2.1.0"
 
 # Cellpose 3.x from PyPI. Pinned to the cp3 major; cp3 and cp4 cannot coexist in
 # one environment, hence the two-env design (see APPOSE_CELLPOSE_PORTING.md).

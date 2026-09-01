@@ -38,6 +38,7 @@ public final class CellAPposePrefs {
     private static final String CATEGORY_ENV = "cellAPpose: Python environment";
 
     private static javafx.beans.property.StringProperty envBaseDir;
+    private static javafx.beans.property.StringProperty envVariant;
     private static javafx.beans.property.StringProperty envLastBuiltCp3;
     private static javafx.beans.property.StringProperty envLastBuiltCp4;
     private static boolean paneInstalled = false;
@@ -96,6 +97,7 @@ public final class CellAPposePrefs {
         }
         logger.info("Installing CellAPpose preferences");
         envBaseDir = PathPrefs.createPersistentPreference(PREFIX + "env.baseDir", "");
+        envVariant = PathPrefs.createPersistentPreference(PREFIX + "env.variant", "CPU");
         envLastBuiltCp3 = PathPrefs.createPersistentPreference(PREFIX + "env.lastBuilt.cp3", "");
         envLastBuiltCp4 = PathPrefs.createPersistentPreference(PREFIX + "env.lastBuilt.cp4", "");
         family = PathPrefs.createPersistentPreference(PREFIX + "family", DEFAULT_FAMILY);
@@ -203,6 +205,17 @@ public final class CellAPposePrefs {
         return cp4Channel3;
     }
 
+    /** Selected environment variant id ("CPU" or "GPU"). */
+    public static String getEnvVariant() {
+        installPreferences();
+        return envVariant.get();
+    }
+
+    public static void setEnvVariant(String v) {
+        installPreferences();
+        envVariant.set(v);
+    }
+
     /** Base dir for the Appose envs, or "" for the Appose default. */
     public static String getEnvBaseDir() {
         installPreferences();
@@ -223,15 +236,12 @@ public final class CellAPposePrefs {
      */
     public static String getEnvLastBuiltDir(CellposeModelFamily f) {
         installPreferences();
-        return (f == CellposeModelFamily.CP4
-                ? envLastBuiltCp4 : envLastBuiltCp3).get();
+        return (f == CellposeModelFamily.CP4 ? envLastBuiltCp4 : envLastBuiltCp3).get();
     }
 
-    public static void setEnvLastBuiltDir(CellposeModelFamily f,
-                                          String v) {
+    public static void setEnvLastBuiltDir(CellposeModelFamily f, String v) {
         installPreferences();
-        (f == CellposeModelFamily.CP4
-                ? envLastBuiltCp4 : envLastBuiltCp3).set(v == null ? "" : v);
+        (f == CellposeModelFamily.CP4 ? envLastBuiltCp4 : envLastBuiltCp3).set(v == null ? "" : v);
     }
 
     /** Add the environment-location preference to QuPath's Preferences pane. */
@@ -241,8 +251,10 @@ public final class CellAPposePrefs {
         }
         installPreferences();
         paneInstalled = true;
-        qupath.getPreferencePane().getPropertySheet().getItems().add(
-                new PropertyItemBuilder<>(envBaseDir, String.class)
+        qupath.getPreferencePane()
+                .getPropertySheet()
+                .getItems()
+                .add(new PropertyItemBuilder<>(envBaseDir, String.class)
                         .propertyType(PropertyItemBuilder.PropertyType.DIRECTORY)
                         .name("Python environment location")
                         .category(CATEGORY_ENV)
@@ -254,6 +266,23 @@ public final class CellAPposePrefs {
                                 + "there. Changing it builds NEW environments; the old ones are "
                                 + "left alone and you are asked about removing them only after "
                                 + "the new ones work.")
+                        .build());
+
+        qupath.getPreferencePane()
+                .getPropertySheet()
+                .getItems()
+                .add(new PropertyItemBuilder<>(envVariant, String.class)
+                        .propertyType(PropertyItemBuilder.PropertyType.CHOICE)
+                        .choices(java.util.List.of("CPU", "GPU"))
+                        .name("Compute variant")
+                        .category(CATEGORY_ENV)
+                        .description("Which environment to install: 'CPU' (default, installs "
+                                + "anywhere) or 'GPU' (CUDA, and REQUIRES an NVIDIA GPU -- it "
+                                + "cannot be installed without one). Segmentation is the "
+                                + "workload a GPU is actually for, so unlike some of the other "
+                                + "extensions the GPU variant is worth having here. Switching "
+                                + "builds separate environments per model family and "
+                                + "re-downloads several GB.")
                         .build());
     }
 }

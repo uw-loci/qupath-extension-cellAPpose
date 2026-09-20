@@ -238,7 +238,7 @@ public final class ManageEnvironmentsDialog {
         } catch (Exception e) {
             logger.error("Failed to delete env {}", row.family, e);
             qupath.fx.dialogs.Dialogs.showErrorMessage(
-                    "CellAPpose Environments", "Failed to delete environment: " + e.getMessage());
+                    "CellAPpose Environments - Error", "Failed to delete environment: " + e.getMessage());
         }
         refreshAll();
     }

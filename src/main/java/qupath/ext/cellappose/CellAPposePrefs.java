@@ -7,6 +7,7 @@ import javafx.beans.property.StringProperty;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import qupath.ext.cellappose.core.CellposeModelFamily;
+import qupath.ext.cellappose.service.ApposeGpu;
 import qupath.fx.prefs.controlsfx.PropertyItemBuilder;
 import qupath.lib.gui.QuPathGUI;
 import qupath.lib.gui.prefs.PathPrefs;
@@ -283,6 +284,16 @@ public final class CellAPposePrefs {
                                 + "extensions the GPU variant is worth having here. Switching "
                                 + "builds separate environments per model family and "
                                 + "re-downloads several GB.")
+                        .build());
+        qupath.getPreferencePane()
+                .getPropertySheet()
+                .getItems()
+                .add(new PropertyItemBuilder<>(ApposeGpu.preferenceProperty(), String.class)
+                        .propertyType(PropertyItemBuilder.PropertyType.CHOICE)
+                        .choices(ApposeGpu.preferenceChoices())
+                        .name(ApposeGpu.PREFERENCE_NAME)
+                        .category(CATEGORY_ENV)
+                        .description(ApposeGpu.preferenceDescription())
                         .build());
     }
 }

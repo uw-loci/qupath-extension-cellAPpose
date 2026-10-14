@@ -1,29 +1,22 @@
 package qupath.ext.cellappose.service;
 
-import java.io.BufferedReader;
 import java.io.IOException;
-import java.io.InputStream;
-import java.io.InputStreamReader;
-import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.EnumMap;
 import java.util.Map;
 import java.util.concurrent.Callable;
 import java.util.function.Consumer;
-import java.util.stream.Collectors;
 import org.apposed.appose.Appose;
 import org.apposed.appose.Environment;
 import org.apposed.appose.Service;
 import org.apposed.appose.Service.ResponseType;
 import org.apposed.appose.Service.Task;
-import org.apposed.appose.TaskException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import qupath.ext.cellappose.core.CellposeModelFamily;
 import qupath.ext.cellappose.core.ComputeVariant;
 import qupath.ext.cellappose.ui.PythonConsoleWindow;
-import qupath.lib.common.GeneralTools;
 
 /**
  * Singleton managing two Appose environments -- one per {@link CellposeModelFamily}.
@@ -36,13 +29,15 @@ import qupath.lib.common.GeneralTools;
  * <p>This generalizes PPM's {@code ApposePPMService} single-env helpers to be
  * family-keyed: {@code getEnvironmentPath(family)}, {@code isEnvironmentBuilt(family)},
  * {@code buildEnvironment(family, callback)}, {@code runTile(family, inputs)},
- * {@code deleteEnvironment(family)}. The TCCL swap, syncManifest, init+verify, and
- * shutdown-hook patterns are copied from PPM.
+ * {@code deleteEnvironment(family)}. The generic plumbing (manifest staging, pixi,
+ * worker shutdown, failure classification, the thread-death retry) lives in the
+ * shared copies {@link ApposeSupport} and {@link ApposeTaskRunner}.
  */
 public final class ApposeCellposeService {
 
     private static final Logger logger = LoggerFactory.getLogger(ApposeCellposeService.class);
 
+    private static final String TITLE = "CellAPpose";
     private static final String RESOURCE_BASE = "qupath/ext/cellappose/";
     private static final String SCRIPTS_BASE = RESOURCE_BASE + "scripts/";
 
@@ -62,16 +57,42 @@ public final class ApposeCellposeService {
     }
 
     /** Per-family state: the Appose env + service + the cached-model key. */
-    private static final class EnvHandle {
+    private final class EnvHandle {
         private final CellposeModelFamily family;
         private Environment environment;
         private Service pythonService;
         private boolean initialized;
         private String initError;
         private String cachedModelKey;
+        // The init inputs behind cachedModelKey, so a replaced worker can reload
+        // the same model before the next tile runs.
+        private Map<String, Object> cachedModelInputs;
         // Per-tile task script, loaded once from the JAR at build time and reused for
         // every tile (avoids re-reading + re-parsing the script per tile on a WSI).
         private String cachedTaskScript;
+        // How ApposeTaskRunner reaches this family's worker and replaces a stale one.
+        private final ApposeTaskRunner.WorkerSource workerSource = new ApposeTaskRunner.WorkerSource() {
+            @Override
+            public Service worker() throws IOException {
+                Service service = pythonService;
+                if (service != null && !service.isAlive() && initialized && environment != null) {
+                    // Died since the build (OOM kill, user killed it): the environment is
+                    // still there, so respawn the worker rather than fail the whole run.
+                    logger.warn("cellAPpose {} Python worker is not alive; recreating it before the task", family);
+                    restartWorker(EnvHandle.this, service);
+                    service = pythonService;
+                }
+                if (service == null) {
+                    throw new IOException("cellAPpose " + family + " service is not available");
+                }
+                return service;
+            }
+
+            @Override
+            public void replaceWorker(Service stale) throws IOException {
+                restartWorker(EnvHandle.this, stale);
+            }
+        };
 
         EnvHandle(CellposeModelFamily family) {
             this.family = family;
@@ -102,8 +123,7 @@ public final class ApposeCellposeService {
      * disk? Does NOT trigger any downloads or Appose init.
      */
     public static boolean isEnvironmentBuilt(CellposeModelFamily family) {
-        Path envDir = getEnvironmentPath(family);
-        return Files.isDirectory(envDir.resolve(".pixi"));
+        return ApposeEnvLocation.isBuilt(getEnvironmentPath(family));
     }
 
     /** Whether the family's service is initialized and ready to run tiles. */
@@ -140,15 +160,16 @@ public final class ApposeCellposeService {
             // Manifest and lock come from the same family AND variant, so they
             // cannot be paired wrongly.
             ComputeVariant computeVariant = variant();
-            String pixiToml = loadResource(RESOURCE_BASE + family.tomlResource(computeVariant));
-            String pixiLock = loadResource(RESOURCE_BASE + family.lockResource(computeVariant));
+            String pixiToml = ApposeSupport.loadResource(RESOURCE_BASE + family.tomlResource(computeVariant));
+            String pixiLock = ApposeSupport.loadResource(RESOURCE_BASE + family.lockResource(computeVariant));
 
             ClassLoader original = Thread.currentThread().getContextClassLoader();
-            Thread.currentThread().setContextClassLoader(ApposeCellposeService.class.getClassLoader());
+            Thread.currentThread().setContextClassLoader(ApposeSupport.extensionClassLoader());
             try {
+                long setupStart = System.nanoTime();
                 // Sync manifest + lock; the staged lock lets the install run
                 // --frozen (exact pinned versions, no re-resolution).
-                syncManifest(family, pixiToml, pixiLock);
+                ApposeSupport.syncManifest(getEnvironmentPath(family), pixiToml, pixiLock, logger);
 
                 report(statusCallback, "Building pixi environment (this may take several minutes)...");
                 // NOTE: do NOT pass .flags("--frozen") here. Appose's PixiBuilder injects
@@ -174,27 +195,21 @@ public final class ApposeCellposeService {
                     envBuilder.base(configuredDir.toFile());
                     logger.info("Building the {} environment at the configured location: {}", family, configuredDir);
                 }
+                long buildStart = System.nanoTime();
                 h.environment = envBuilder.build();
-                logger.info("cellAPpose {} env configured at: {}", family, h.environment.base());
+                logger.info(
+                        "cellAPpose {} env configured at {} ({} ms)",
+                        family,
+                        h.environment.base(),
+                        ApposeSupport.elapsedMs(buildStart));
 
                 // Install strictly from the bundled lock (--frozen) so cellpose +
                 // torch are the exact pinned versions and pixi never re-resolves.
                 runPixiInstall(family, statusCallback);
 
                 report(statusCallback, "Starting Python service...");
-                h.pythonService = h.environment.python();
-                wireConsole(h);
-
-                // Init script, run once; its non-underscore globals persist into every
-                // subsequent task scope (Appose init-export semantics). Two jobs:
-                //   1. Pre-import numpy first to dodge the Windows stdin-reader deadlock.
-                //   2. Define cp_utils' helpers (get_torch_device, ...) as worker globals.
-                // The vendored cp3/cp4/init scripts only "from cp_utils import ..." under
-                // their non-appose branch; in appose mode they expect get_torch_device to
-                // already be in scope (upstream injects it the same way), so without this
-                // the model init raises NameError: name 'get_torch_device' is not defined.
-                String cpUtils = loadScript("cp_utils.py");
-                h.pythonService.init("import numpy\n" + cpUtils);
+                long workerStart = System.nanoTime();
+                spawnWorker(h);
 
                 report(statusCallback, "Verifying installed packages...");
                 String verifyScript = loadScript("verify_env.py");
@@ -211,13 +226,20 @@ public final class ApposeCellposeService {
                     throw new IOException("Python verification failed: " + importError);
                 }
                 logger.info(
-                        "=== cellAPpose {} environment ===\n  cellpose: {}\n  torch: {}\n  cuda: {}\n  mps: {}\n  path: {}",
+                        "=== cellAPpose {} environment ===\n  cellpose: {}\n  torch: {}\n  cuda: {}\n  mps: {}\n"
+                                + "  path: {}\n  worker start: {} ms\n  setup: {} ms",
                         family,
                         verifyTask.outputs.get("cellpose_version"),
                         verifyTask.outputs.get("torch_version"),
                         verifyTask.outputs.get("cuda_available"),
                         verifyTask.outputs.get("mps_available"),
-                        getEnvironmentPath(family));
+                        getEnvironmentPath(family),
+                        ApposeSupport.elapsedMs(workerStart),
+                        ApposeSupport.elapsedMs(setupStart));
+
+                if (computeVariant == ComputeVariant.GPU) {
+                    ApposeGpu.checkWorker(h.pythonService, "cellAPpose " + family, logger);
+                }
 
                 // Load the per-tile task script ONCE; reuse it for every tile.
                 h.cachedTaskScript = loadScript(family.taskScript());
@@ -236,18 +258,18 @@ public final class ApposeCellposeService {
             // Match failure signatures against the full cause chain -- pixi's
             // BuildException only says "pixi build failed" at the top; the
             // actionable Windows file-lock text lives in a nested cause.
-            String fullMsg = collectCauseMessages(e);
+            String fullMsg = ApposeSupport.collectCauseMessages(e);
             h.initError = e.getMessage();
             h.initialized = false;
             logger.error("Failed to build cellAPpose {} env: {}", family, e.getMessage(), e);
-            if (looksLikeWindowsFileLock(fullMsg)) {
+            if (ApposeSupport.looksLikeWindowsFileLock(fullMsg)) {
                 logger.warn(
                         "Pixi env install hit a Windows file lock; manual recovery required\n{}",
-                        windowsFileLockAdvice(family.envName(variant())));
+                        ApposeSupport.windowsFileLockAdvice(getEnvironmentPath(family)));
                 report(statusCallback, "Pixi env install failed: Windows file lock. See recovery steps.");
                 try {
                     qupath.fx.dialogs.Dialogs.showWarningNotification(
-                            "CellAPpose",
+                            TITLE,
                             "Pixi env install failed: a file was locked by another process. Close QuPath,"
                                     + " delete the .pixi folder, and relaunch. See the log for full recovery steps.");
                 } catch (Exception fxEx) {
@@ -279,11 +301,15 @@ public final class ApposeCellposeService {
             return; // already cached
         }
         logger.info("Loading {} model (cache key {})...", family, modelCacheKey);
+        long start = System.nanoTime();
+        h.cachedModelKey = null;
         Task task = submit(family, family.initScript(), initInputs);
         if (task.error != null && !task.error.isEmpty()) {
             throw new IOException("cellAPpose " + family + " model load failed: " + task.error);
         }
+        logger.info("Loaded the {} model in {} ms", family, ApposeSupport.elapsedMs(start));
         h.cachedModelKey = modelCacheKey;
+        h.cachedModelInputs = initInputs;
     }
 
     /**
@@ -319,6 +345,7 @@ public final class ApposeCellposeService {
             closeService(h);
             h.initialized = false;
             h.cachedModelKey = null;
+            h.cachedModelInputs = null;
         }
         removeShutdownHook();
         logger.info("cellAPpose services shut down");
@@ -333,6 +360,7 @@ public final class ApposeCellposeService {
         closeService(h);
         h.initialized = false;
         h.cachedModelKey = null;
+        h.cachedModelInputs = null;
         if (h.environment != null) {
             try {
                 logger.info("Deleting cellAPpose {} env via API: {}", family, h.environment.base());
@@ -347,19 +375,13 @@ public final class ApposeCellposeService {
         Path envPath = getEnvironmentPath(family);
         if (Files.exists(envPath)) {
             logger.info("Deleting cellAPpose env directory: {}", envPath);
-            deleteDirectoryRecursively(envPath);
+            ApposeSupport.deleteDirectoryRecursively(envPath);
         }
     }
 
     /** Executes a callable with the extension classloader as TCCL. */
     public static <T> T withExtensionClassLoader(Callable<T> callable) throws Exception {
-        ClassLoader original = Thread.currentThread().getContextClassLoader();
-        Thread.currentThread().setContextClassLoader(ApposeCellposeService.class.getClassLoader());
-        try {
-            return callable.call();
-        } finally {
-            Thread.currentThread().setContextClassLoader(original);
-        }
+        return ApposeSupport.withExtensionClassLoader(callable);
     }
 
     // ==================== Internal helpers ====================
@@ -378,59 +400,95 @@ public final class ApposeCellposeService {
     /**
      * Submits a task using a pre-loaded script string (used for the cached per-tile script).
      *
-     * <p>Retries on the well-known Appose "thread death" race: under repeated submission a prior
-     * task's worker-thread cleanup event is occasionally misattributed to the next task's UUID, so
-     * Java sees an immediate FAILURE even though the Python side is healthy. This bites on the first
-     * real per-tile run (a WSI submits the per-tile script thousands of times) even though our
-     * submission is serialized. On a {@code thread death} TaskException we sleep 250 ms and resubmit,
-     * up to 3 total attempts. Pattern from the DL pixel classifier / fiber-analysis services.
+     * <p>A stale worker (Appose "thread death" before any Python ran) is replaced,
+     * the model reloaded, and the task retried, up to 3 attempts with a growing
+     * delay; a failure after the script started is not retried. The rules are in
+     * {@link ApposeTaskRunner}. A WSI submits this script thousands of times, so
+     * a retry that reused the worker would leave a zombie inference holding GPU
+     * memory beside its retry.
      */
     private Task submitScript(CellposeModelFamily family, String scriptName, String script, Map<String, Object> inputs)
             throws IOException {
         EnvHandle h = handle(family);
+        return ApposeTaskRunner.run(
+                "cellAPpose " + family,
+                h.workerSource,
+                scriptName,
+                script,
+                inputs,
+                new ApposeTaskRunner.Options().maxAttempts(3).retryDelayMs(250));
+    }
+
+    /**
+     * Creates the family's Python worker and queues its init script. Does NOT
+     * start the subprocess; Appose does that on the first task.
+     *
+     * <p>Caller must hold the monitor and have the extension classloader set as
+     * TCCL. The init script, run once, has two jobs: pre-import numpy first to
+     * dodge the Windows stdin-reader deadlock, and define cp_utils' helpers
+     * (get_torch_device, ...) as worker globals. The vendored cp3/cp4 init
+     * scripts expect get_torch_device to already be in scope in appose mode, so
+     * without this the model init raises NameError.
+     */
+    private void spawnWorker(EnvHandle h) throws IOException {
+        h.pythonService = ApposeGpu.pinned(h.environment).python();
+        wireConsole(h);
+        String cpUtils = loadScript("cp_utils.py");
+        h.pythonService.init("import numpy\n" + cpUtils);
+    }
+
+    /**
+     * Replaces the family's worker: stops the stale subprocess, starts a fresh
+     * one and reloads the model that was loaded before, so the next tile finds
+     * {@code model} in scope. A no-op when {@code stale} is no longer the
+     * current worker.
+     */
+    private void restartWorker(EnvHandle h, Service stale) throws IOException {
+        if (h.environment == null) {
+            throw new IOException("Cannot restart the cellAPpose " + h.family + " worker: environment not built");
+        }
+        if (stale != null && h.pythonService != stale) {
+            logger.info("cellAPpose {} worker was already replaced; skipping redundant restart", h.family);
+            return;
+        }
         ClassLoader original = Thread.currentThread().getContextClassLoader();
-        Thread.currentThread().setContextClassLoader(ApposeCellposeService.class.getClassLoader());
+        Thread.currentThread().setContextClassLoader(ApposeSupport.extensionClassLoader());
         try {
-            int maxAttempts = 3;
-            TaskException lastThreadDeath = null;
-            for (int attempt = 1; attempt <= maxAttempts; attempt++) {
-                try {
-                    Task task = h.pythonService.task(script, inputs);
-                    task.listen(event -> {
-                        if (event.responseType == ResponseType.CRASH) {
-                            logger.error("cellAPpose {} '{}' CRASH: {}", family, scriptName, task.error);
-                        } else if (event.responseType == ResponseType.FAILURE) {
-                            logger.error("cellAPpose {} '{}' FAILURE: {}", family, scriptName, task.error);
-                        }
-                    });
-                    task.waitFor();
-                    return task;
-                } catch (TaskException e) {
-                    String message =
-                            e.getMessage() == null ? "" : e.getMessage().toLowerCase();
-                    if (message.contains("thread death") && attempt < maxAttempts) {
-                        lastThreadDeath = e;
-                        logger.warn(
-                                "cellAPpose {} '{}' hit Appose thread-death on attempt {}/{}; retrying",
-                                family,
-                                scriptName,
-                                attempt,
-                                maxAttempts);
-                        Thread.sleep(250);
-                        continue;
-                    }
-                    throw new IOException(
-                            "cellAPpose " + family + " '" + scriptName + "' failed: " + e.getMessage(), e);
+            long start = System.nanoTime();
+            Service old = h.pythonService;
+            h.pythonService = null;
+            ApposeSupport.stopWorker(old, 3000, logger);
+            spawnWorker(h);
+            // Start the subprocess now: Appose starts it lazily on the first task, and an
+            // unstarted worker reports isAlive() == false, which the worker source would
+            // read as another dead worker and restart again from inside the reload below.
+            h.pythonService.start();
+            String modelKey = h.cachedModelKey;
+            Map<String, Object> modelInputs = h.cachedModelInputs;
+            h.cachedModelKey = null;
+            if (modelKey != null && modelInputs != null) {
+                // Single attempt: a freshly started worker cannot be the stale kind.
+                Task task = ApposeTaskRunner.run(
+                        "cellAPpose " + h.family,
+                        h.workerSource,
+                        h.family.initScript(),
+                        loadScript(h.family.initScript()),
+                        modelInputs,
+                        new ApposeTaskRunner.Options().maxAttempts(1));
+                if (task.error != null && !task.error.isEmpty()) {
+                    throw new IOException("cellAPpose " + h.family + " model reload failed: " + task.error);
                 }
+                h.cachedModelKey = modelKey;
             }
-            throw new IOException(
-                    "cellAPpose " + family + " '" + scriptName + "' failed after " + maxAttempts
-                            + " attempts (Appose thread death): "
-                            + (lastThreadDeath == null ? "" : lastThreadDeath.getMessage()),
-                    lastThreadDeath);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new IOException("cellAPpose " + family + " '" + scriptName + "' interrupted", e);
+            logger.info(
+                    "cellAPpose {} worker restarted in {} ms{}",
+                    h.family,
+                    ApposeSupport.elapsedMs(start),
+                    modelKey != null ? " and the model reloaded" : "");
+        } catch (IOException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new IOException("Failed to restart the cellAPpose " + h.family + " worker: " + e.getMessage(), e);
         } finally {
             Thread.currentThread().setContextClassLoader(original);
         }
@@ -445,173 +503,38 @@ public final class ApposeCellposeService {
     }
 
     private void closeService(EnvHandle h) {
-        if (h.pythonService != null) {
-            try {
-                logger.info("Shutting down cellAPpose {} service...", h.family);
-                h.pythonService.close();
-                if (h.pythonService.isAlive()) {
-                    long deadline = System.currentTimeMillis() + 5000;
-                    while (h.pythonService.isAlive() && System.currentTimeMillis() < deadline) {
-                        try {
-                            Thread.sleep(200);
-                        } catch (InterruptedException e) {
-                            Thread.currentThread().interrupt();
-                            break;
-                        }
-                    }
-                }
-                if (h.pythonService.isAlive()) {
-                    logger.warn("cellAPpose {} did not exit gracefully, force-killing", h.family);
-                    h.pythonService.kill();
-                }
-            } catch (Exception e) {
-                try {
-                    h.pythonService.kill();
-                } catch (Exception ignored) {
-                    // nothing more we can do
-                }
-                logger.warn("Error during cellAPpose {} shutdown: {}", h.family, e.getMessage());
-            }
+        Service service = h.pythonService;
+        if (service != null) {
+            logger.info("Shutting down cellAPpose {} service...", h.family);
+            ApposeSupport.stopWorker(service, 5000, logger);
             h.pythonService = null;
         }
     }
 
-    /** Runs {@code pixi install} for the family's manifest to resolve all deps. */
+    /** Runs {@code pixi install --frozen} for the family's manifest to resolve all deps. */
     private void runPixiInstall(CellposeModelFamily family, Consumer<String> statusCallback) throws IOException {
         EnvHandle h = handle(family);
         Path envBase = Path.of(h.environment.base());
         Path manifestPath = envBase.resolve("pixi.toml");
-        Path pixi = findPixiBinary();
+        Path pixi = ApposeSupport.findPixiBinary();
         if (pixi == null) {
             throw new IOException("Cannot find pixi binary. The Appose environment may not "
                     + "have been set up correctly. Try rebuilding the environment.");
         }
         report(statusCallback, "Installing Python dependencies (several minutes on first run)...");
+        long start = System.nanoTime();
         // --frozen: install the exact versions in the bundled lock; never re-resolve.
-        java.util.List<String> command =
-                java.util.List.of(pixi.toString(), "install", "--frozen", "--manifest-path", manifestPath.toString());
-        logger.info("Running: {}", command);
-        ProcessBuilder pb = new ProcessBuilder(command);
-        pb.directory(envBase.toFile());
-        pb.redirectErrorStream(true);
-        Process process = pb.start();
-        StringBuilder output = new StringBuilder();
-        try (BufferedReader reader =
-                new BufferedReader(new InputStreamReader(process.getInputStream(), StandardCharsets.UTF_8))) {
-            String line;
-            while ((line = reader.readLine()) != null) {
-                output.append(line).append("\n");
-                logger.info("[pixi] {}", line);
-                PythonConsoleWindow.appendMessage("[pixi] " + line);
-            }
-        }
-        int exitCode;
-        try {
-            exitCode = process.waitFor();
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new IOException("pixi install interrupted", e);
-        }
-        if (exitCode != 0) {
-            throw new IOException("pixi install failed (exit code " + exitCode + "):\n" + output);
-        }
-    }
-
-    private Path findPixiBinary() {
-        Path apposeDir = Path.of(System.getProperty("user.home"), ".local", "share", "appose");
-        String pixiName = GeneralTools.isWindows() ? "pixi.exe" : "pixi";
-        Path pixi = apposeDir.resolve(".pixi").resolve("bin").resolve(pixiName);
-        if (Files.isRegularFile(pixi)) {
-            return pixi;
-        }
-        try {
-            Process p = new ProcessBuilder(pixiName, "--version")
-                    .redirectErrorStream(true)
-                    .start();
-            if (p.waitFor() == 0) {
-                return Path.of(pixiName);
-            }
-        } catch (IOException | InterruptedException ignored) {
-            // not on PATH
-        }
-        return null;
-    }
-
-    /**
-     * Sync the family's on-disk pixi.toml AND pixi.lock with the bundled
-     * versions. The lock pins the full dependency tree and the env installs
-     * with --frozen, so the lock is staged into the env dir: first run stages
-     * the lock (Appose writes the manifest); a change to either file rewrites
-     * both and wipes .pixi/ for a clean reinstall; otherwise the lock is
-     * re-staged if a prior wipe removed it.
-     */
-    private void syncManifest(CellposeModelFamily family, String expectedToml, String expectedLock) {
-        try {
-            Path envDir = getEnvironmentPath(family);
-            Path pixiTomlFile = envDir.resolve("pixi.toml");
-            Path lockFile = envDir.resolve("pixi.lock");
-
-            if (!Files.exists(pixiTomlFile)) {
-                Files.createDirectories(envDir);
-                Files.writeString(lockFile, expectedLock, StandardCharsets.UTF_8);
-                return;
-            }
-            String existing = Files.readString(pixiTomlFile, StandardCharsets.UTF_8)
-                    .replace("\r\n", "\n")
-                    .strip();
-            String exToml = expectedToml.replace("\r\n", "\n").strip();
-            String onLock = Files.exists(lockFile)
-                    ? Files.readString(lockFile, StandardCharsets.UTF_8)
-                            .replace("\r\n", "\n")
-                            .strip()
-                    : "";
-            String exLock = expectedLock.replace("\r\n", "\n").strip();
-            if (existing.equals(exToml) && onLock.equals(exLock)) {
-                if (!Files.exists(lockFile)) {
-                    Files.writeString(lockFile, expectedLock, StandardCharsets.UTF_8);
-                }
-                return;
-            }
-            logger.info("cellAPpose {} manifest/lock changed -- forcing rebuild", family);
-            Files.writeString(pixiTomlFile, expectedToml, StandardCharsets.UTF_8);
-            Files.writeString(lockFile, expectedLock, StandardCharsets.UTF_8);
-            Path pixiDir = envDir.resolve(".pixi");
-            if (Files.isDirectory(pixiDir)) {
-                try {
-                    deleteDirectoryRecursively(pixiDir);
-                } catch (IOException e) {
-                    Path renamed = envDir.resolve(".pixi_old_" + System.currentTimeMillis());
-                    try {
-                        Files.move(pixiDir, renamed);
-                    } catch (IOException e2) {
-                        logger.warn("Could not delete or rename .pixi/ -- env may not rebuild: {}", e2.getMessage());
-                    }
-                }
-            }
-        } catch (IOException e) {
-            logger.warn("Failed to sync pixi manifest/lock (will build anyway): {}", e.getMessage());
-        }
-    }
-
-    private static void deleteDirectoryRecursively(Path directory) throws IOException {
-        java.nio.file.FileVisitor<Path> visitor = new java.nio.file.SimpleFileVisitor<>() {
-            @Override
-            public java.nio.file.FileVisitResult visitFile(Path file, java.nio.file.attribute.BasicFileAttributes attrs)
-                    throws IOException {
-                Files.delete(file);
-                return java.nio.file.FileVisitResult.CONTINUE;
-            }
-
-            @Override
-            public java.nio.file.FileVisitResult postVisitDirectory(Path dir, IOException exc) throws IOException {
-                if (exc != null) {
-                    throw exc;
-                }
-                Files.delete(dir);
-                return java.nio.file.FileVisitResult.CONTINUE;
-            }
-        };
-        Files.walkFileTree(directory, visitor);
+        ApposeSupport.runPixiCommand(
+                pixi,
+                envBase,
+                manifestPath,
+                line -> {
+                    logger.info("[pixi] {}", line);
+                    PythonConsoleWindow.appendMessage("[pixi] " + line);
+                },
+                "install",
+                "--frozen");
+        logger.info("pixi install --frozen finished in {} ms", ApposeSupport.elapsedMs(start));
     }
 
     private synchronized void registerShutdownHook() {
@@ -622,24 +545,7 @@ public final class ApposeCellposeService {
                 () -> {
                     logger.info("JVM shutdown hook: cleaning up cellAPpose Python subprocesses");
                     for (EnvHandle h : handles.values()) {
-                        Service svc = h.pythonService;
-                        if (svc != null) {
-                            try {
-                                svc.close();
-                                if (svc.isAlive()) {
-                                    Thread.sleep(2000);
-                                }
-                                if (svc.isAlive()) {
-                                    svc.kill();
-                                }
-                            } catch (Exception e) {
-                                try {
-                                    svc.kill();
-                                } catch (Exception ignored) {
-                                    // give up
-                                }
-                            }
-                        }
+                        ApposeSupport.stopWorker(h.pythonService, 2000, logger);
                     }
                 },
                 "CellAPpose-ShutdownHook");
@@ -648,73 +554,12 @@ public final class ApposeCellposeService {
     }
 
     private void removeShutdownHook() {
-        if (shutdownHook != null) {
-            try {
-                Runtime.getRuntime().removeShutdownHook(shutdownHook);
-            } catch (IllegalStateException e) {
-                // JVM already shutting down
-            }
-            shutdownHook = null;
-        }
+        ApposeSupport.removeShutdownHook(shutdownHook);
+        shutdownHook = null;
     }
 
     private String loadScript(String scriptFileName) throws IOException {
-        return loadResource(SCRIPTS_BASE + scriptFileName);
-    }
-
-    private static String loadResource(String resourcePath) throws IOException {
-        try (InputStream is = ApposeCellposeService.class.getClassLoader().getResourceAsStream(resourcePath)) {
-            if (is == null) {
-                throw new IOException("Resource not found: " + resourcePath);
-            }
-            try (BufferedReader reader = new BufferedReader(new InputStreamReader(is, StandardCharsets.UTF_8))) {
-                return reader.lines().collect(Collectors.joining("\n"));
-            }
-        }
-    }
-
-    /** Concatenate the message of a throwable and its entire cause chain.
-     *  pixi's BuildException only says "pixi build failed" at the top; the
-     *  actionable "failed to link ... os error 32" text lives in a nested
-     *  cause, so failure-signature detection must see the whole chain. */
-    private static String collectCauseMessages(Throwable t) {
-        StringBuilder sb = new StringBuilder();
-        int guard = 0;
-        for (Throwable c = t; c != null && guard < 20; c = c.getCause(), guard++) {
-            if (c.getMessage() != null) {
-                sb.append(c.getMessage()).append('\n');
-            }
-        }
-        return sb.toString();
-    }
-
-    /** True when the Pixi build failed because Windows held an exclusive lock
-     *  on a file the conda link step needed to replace (canonical signature:
-     *  "failed to link" + "os error 32" / "being used by another process").
-     *  Do NOT auto-wipe -- the blocking process may still be writing. */
-    private static boolean looksLikeWindowsFileLock(String message) {
-        if (message == null) return false;
-        return message.contains("failed to link")
-                && (message.contains("os error 32") || message.contains("being used by another process"));
-    }
-
-    /** Recovery instructions for the Windows file-lock failure mode during the
-     *  Pixi env install. Surfaced to the log; a short notification points here. */
-    private static String windowsFileLockAdvice(String envName) {
-        return "The Python environment could not finish building because another"
-                + " process is holding a file open inside the env directory.\n\n"
-                + "RECOVERY STEPS (Windows):\n"
-                + "  1. Close QuPath completely (File -> Quit).\n"
-                + "  2. Open Task Manager -- end any leftover java.exe or python.exe"
-                + " running under your user.\n"
-                + "  3. In PowerShell:\n"
-                + "       Remove-Item -Recurse -Force \"$env:USERPROFILE\\.local\\share\\appose\\"
-                + envName + "\\.pixi\"\n"
-                + "  4. (If step 3 fails: reboot Windows -- guaranteed to release every file handle.)\n"
-                + "  5. (Optional) Add an antivirus exclusion for"
-                + " %USERPROFILE%\\.local\\share\\appose\\ to prevent repeat occurrences.\n"
-                + "  6. Relaunch QuPath. The env will rebuild from the bundled lock and the"
-                + " link step will succeed.";
+        return ApposeSupport.loadResource(SCRIPTS_BASE + scriptFileName);
     }
 
     private static void report(Consumer<String> callback, String message) {

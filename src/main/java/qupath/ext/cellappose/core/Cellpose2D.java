@@ -11,6 +11,7 @@ import org.apposed.appose.NDArray;
 import org.apposed.appose.Service.Task;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import qupath.ext.cellappose.service.ApposeArrays;
 import qupath.ext.cellappose.service.ApposeCellposeService;
 import qupath.lib.geom.ImmutableDimension;
 import qupath.lib.images.ImageData;
@@ -43,7 +44,7 @@ public final class Cellpose2D {
 
     /**
      * Largest label value the shared uint16 output buffer can carry
-     * (see {@link NDArrays#allocateLabelNDArray(int, int)}).
+     * (see {@link qupath.ext.cellappose.service.ApposeArrays#allocateLabelsUint16HW(int, int)}).
      */
     private static final int MAX_LABELS_PER_TILE = 65535;
 
@@ -295,7 +296,7 @@ public final class Cellpose2D {
                 if (bands.length > 3) {
                     bands = java.util.Arrays.copyOf(bands, 3); // cpsam takes at most 3 channels
                 }
-                tile = NDArrays.bufferedImageToSelectedChannelsCHWNDArray(img, bands); // (k, H, W)
+                tile = ApposeArrays.bandsFloat32CHW(img, bands); // (k, H, W)
                 hasChannelAxis = true; // overridden below to channel_axis=0 (channels-first)
                 overrideCp4Channels = true;
                 cp4NChannels = bands.length;
@@ -306,7 +307,7 @@ public final class Cellpose2D {
                 if (bands.length == 0) {
                     bands = new int[] {0}; // no channel selected -> first channel, grayscale
                 }
-                tile = NDArrays.bufferedImageToSelectedChannelsNDArray(img, bands);
+                tile = ApposeArrays.bandsFloat32HWC(img, bands);
                 if (bands.length > 1) {
                     hasChannelAxis = true;
                     cellChannelOverride = 1; // compact tile: band 0 = cyto -> cellpose channel 1
@@ -317,13 +318,13 @@ public final class Cellpose2D {
                     nucleiChannelOverride = 0;
                 }
             } else if (trueRgb) {
-                tile = NDArrays.bufferedImageToRGBNDArray(img); // (H, W, 3) uint8 (CP3 RGB)
+                tile = ApposeArrays.rgbUint8HWC(img); // (H, W, 3) uint8 (CP3 RGB)
                 hasChannelAxis = true;
             } else {
-                tile = NDArrays.bufferedImageToGrayNDArray(img); // (H, W) uint8 single channel
+                tile = ApposeArrays.grayUint8HW(img); // (H, W) uint8 single channel
                 hasChannelAxis = false;
             }
-            labels = NDArrays.allocateLabelNDArray(h, w);
+            labels = ApposeArrays.allocateLabelsUint16HW(h, w);
 
             java.util.Map<String, Object> inputs = params.toApposeInputs(tile, labels, hasChannelAxis);
             if (cp3Multichannel) {
@@ -345,7 +346,7 @@ public final class Cellpose2D {
             logger.debug("CellAPpose tile {} -> n_labels={}", request, nLabels);
             checkLabelCount(nLabels, request);
 
-            float[] labelRaster = NDArrays.readLabelsAsFloat(labels, h, w);
+            float[] labelRaster = ApposeArrays.labelsToFloat(labels, h, w);
             return LabelToObjects.labelsToROIs(labelRaster, w, h, request);
         } finally {
             if (tile != null) {

@@ -431,7 +431,7 @@ public final class ApposeCellposeService {
      * without this the model init raises NameError.
      */
     private void spawnWorker(EnvHandle h) throws IOException {
-        h.pythonService = ApposeGpu.pinned(h.environment).python();
+        h.pythonService = ApposeGpu.forWorker(h.environment).python();
         wireConsole(h);
         String cpUtils = loadScript("cp_utils.py");
         h.pythonService.init("import numpy\n" + cpUtils);
